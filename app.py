@@ -20,7 +20,8 @@ from google.oauth2.service_account import Credentials
 # Config (edit if desired)
 # -------------
 # Provided Google Sheet ID (from user)
-SHEET_ID = "1vYcy7ia-9F3MXcw4irI10M3uEm-Hs1GnsLc-RQdSPW8"
+#SHEET_ID = "1vYcy7ia-9F3MXcw4irI10M3uEm-Hs1GnsLc-RQdSPW8"
+SHEET_ID = ""
 
 # Tab names inside the Google Sheet
 TAB_MEMBERS = "members"
@@ -54,6 +55,7 @@ def open_sheet_and_ensure_tabs(gc):
     do not exist, create them and add header rows.
     """
     try:
+        SHEET_ID = st.secrets["sheets"]["google_sheet"]
         sh = gc.open_by_key(SHEET_ID)
     except Exception as e:
         st.error("Failed to open Google Sheet. Check the Sheet ID and that the service account has Editor access.")
@@ -457,3 +459,4 @@ if "schedule" in st.session_state:
 
     st.download_button("📘 Download Excel", excel_bytes, file_name="schedule.xlsx")
     st.download_button("📄 Download PDF", pdf_bytes, file_name="schedule.pdf")
+
