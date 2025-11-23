@@ -34,6 +34,7 @@ from io import BytesIO
 from collections import Counter, defaultdict
 import os
 from io import BytesIO
+import random
 
 # Google API imports
 from google.oauth2 import service_account
@@ -76,7 +77,7 @@ def save_google_sheet(sheet_name, df):
     service = _build_service()
     spreadsheet_id = st.secrets["google_sheets"]["spreadsheet_id"]
     upload_to_google_sheet(service, spreadsheet_id, sheet_name, df)
-    
+
     # values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     # body = {"values": values}
     # # Using update to replace range
@@ -147,10 +148,25 @@ def load_local_cache(path="local_cache.xlsx"):
         members = xl.parse("members") if "members" in xl.sheet_names else pd.DataFrame()
         settings = xl.parse("settings") if "settings" in xl.sheet_names else pd.DataFrame()
         schedule = xl.parse("schedule") if "schedule" in xl.sheet_names else pd.DataFrame()
-        return members, settings, schedule, True
+        status = xl.parse("status") if "status" in xl.sheet_names else pd.DataFrame()
+        return members, settings, schedule, status, True
     except:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), False
 
+
+
+def save_local_cache_sheetname(df, sheet_name, path="local_cache.xlsx"):
+# Ensure clean DataFrames
+    if not isinstance(df, pd.DataFrame):
+        df_save = pd.DataFrame()
+    else:
+        df_save = df
+    
+    with pd.ExcelWriter(path, engine="openpyxl") as writer: 
+        if sheet_name=="schedule":
+            if isinstance(df_save.columns, pd.MultiIndex):
+                df_save.columns = ["_".join([str(c) for c in col]).strip() for col in df_save.columns]
+        df_save.to_excel(writer, sheet_name=sheet_name, index=False)  
 
 def save_local_cache(members, settings, schedule, path="local_cache.xlsx"):
     """Save all tables as an Excel workbook (no JSON)."""
@@ -161,6 +177,8 @@ def save_local_cache(members, settings, schedule, path="local_cache.xlsx"):
         settings = pd.DataFrame()
     if not isinstance(schedule, pd.DataFrame):
         schedule = pd.DataFrame()
+    if not isinstance(status, pd.DataFrame):
+        status = pd.DataFrame()
     
     with pd.ExcelWriter(path, engine="openpyxl") as writer: 
         members.to_excel(writer, sheet_name="members", index=False)
@@ -180,30 +198,113 @@ def try_load_all():
     members_sheet = sheets.get("members_sheet", "members")
     settings_sheet = sheets.get("settings_sheet", "settings")
     schedule_sheet = sheets.get("schedule_sheet", "schedule")
+    status_sheet = sheets.get("status_sheet", "schedule")
     # Attempt Google load
     try:
         members = load_google_sheet(members_sheet)
         settings = load_google_sheet(settings_sheet)
         schedule = load_google_sheet(schedule_sheet)
+        status = load_google_sheet(status_sheet)
         # success
-        return True, members, settings, schedule
+        return True, members, settings, schedule, status
     except Exception as e:
         # Fall back to local cache
-        members, settings, schedule, loaded = load_local_cache()
-        return False, members, settings, schedule
+        members, settings, schedule, status, loaded = load_local_cache()
+        return False, members, settings, schedule, status
 
 # ---------------------- Scheduling algorithm ----------------------
+
+# def generate_schedule(players, num_courts, num_rounds, tries=300):
+#     """
+#     players: list of dicts with keys name, level, gender, active
+#     returns: rounds list where each round is list of groups (each group is 4 names)
+#     """
+#     player_names = [p['name'] for p in players]
+#     n = len(player_names)
+#     per_round = num_courts * 4
+#     if n < 4:
+#         return []
+
+#     games_count = Counter({name: 0 for name in player_names})
+#     partner_count = defaultdict(Counter)
+#     opponent_count = defaultdict(Counter)
+
+#     rounds = []
+
+#     def score(groups):
+#         s = 0
+#         for g in groups:
+#             for p in g:
+#                 s -= games_count[p] * 2.0
+#         for g in groups:
+#             a,b,c,d = g
+#             s -= partner_count[a][b] * 8
+#             s -= partner_count[c][d] * 8
+#             for x in [a,b]:
+#                 for y in [c,d]:
+#                     s -= opponent_count[x][y] * 4
+#         return s
+
+#     # Pre-shuffle initial order to avoid deterministic results
+#     for r in range(num_rounds):
+#         best = None
+#         best_score = -1e12
+#         for t in range(tries):
+#             pool = player_names.copy()
+#             # bias selection towards those with fewer games
+#             pool.sort(key=lambda x: games_count[x])
+#             random.shuffle(pool)
+#             selected = pool[:min(per_round, len(pool))]
+#             random.shuffle(selected)
+#             groups = []
+#             while len(selected) >= 4 and len(groups) < num_courts:
+#                 # pair low with high to mix
+#                 p1 = selected.pop(0)
+#                 p2 = selected.pop(0)
+#                 p3 = selected.pop(-1)
+#                 p4 = selected.pop(-1)
+#                 groups.append([p1,p2,p3,p4])
+#             if len(groups) < num_courts:
+#                 # can't fill all courts, skip
+#                 continue
+#             sc = score(groups)
+#             if sc > best_score:
+#                 best_score = sc
+#                 best = groups
+#         if best is None:
+#             break
+#         # commit
+#         for g in best:
+#             a,b,c,d = g
+#             games_count[a] += 1
+#             games_count[b] += 1
+#             games_count[c] += 1
+#             games_count[d] += 1
+#             partner_count[a][b] += 1
+#             partner_count[b][a] += 1
+#             partner_count[c][d] += 1
+#             partner_count[d][c] += 1
+#             for x in [a,b]:
+#                 for y in [c,d]:
+#                     opponent_count[x][y] += 1
+#                     opponent_count[y][x] += 1
+#         rounds.append(best)
+#     return rounds
+
+
 
 def generate_schedule(players, num_courts, num_rounds, tries=300):
     """
     players: list of dicts with keys name, level, gender, active
-    returns: rounds list where each round is list of groups (each group is 4 names)
+    returns: 
+        rounds: list of rounds (each round is a list of groups of 4 names)
+        games_df: pandas DataFrame with columns ["name", "number_of_game"]
     """
     player_names = [p['name'] for p in players]
     n = len(player_names)
     per_round = num_courts * 4
     if n < 4:
-        return []
+        return [], pd.DataFrame(columns=["name", "number_of_game"])
 
     games_count = Counter({name: 0 for name in player_names})
     partner_count = defaultdict(Counter)
@@ -269,7 +370,15 @@ def generate_schedule(players, num_courts, num_rounds, tries=300):
                     opponent_count[x][y] += 1
                     opponent_count[y][x] += 1
         rounds.append(best)
-    return rounds
+
+    # Convert games_count to a DataFrame
+    games_df = pd.DataFrame([
+        {"name": name, "number_of_game": games_count[name]}
+        for name in player_names
+    ])
+
+    return rounds, games_df
+
 
 # ---------------------- Helpers for display/export ----------------------
 
@@ -306,21 +415,23 @@ def to_excel_bytes(df):
 # ---------------------- Streamlit App ----------------------
 
 st.set_page_config(page_title="Pickleball Scheduler", layout="wide")
-st.title("Elite Group Pickleball Scheduler")
+st.title("🏓Elite Group Pickleball Scheduler")
 
 # Try to load data once at startup
 if "loaded_once" not in st.session_state:
-    online, members_df, settings_df, schedule_df = try_load_all()
+    online, members_df, settings_df, schedule_df, status = try_load_all()
     st.session_state.online = online
     st.session_state.members_df = members_df
     st.session_state.settings_df = settings_df
-    st.session_state.schedule_df = schedule_df
+    st.session_state.schedule_df = schedule_df    
+    st.session_state.game_count_df = status
     st.session_state.loaded_once = True
 else:
     online = st.session_state.online
     members_df = st.session_state.members_df
     settings_df = st.session_state.settings_df
     schedule_df = st.session_state.schedule_df
+    game_count_df = st.session_state.game_count_df
 
 # Sidebar: show mode and allow retry
 st.sidebar.header("Connection")
@@ -332,20 +443,25 @@ else:
 # Allow user to force a reload attempt
 if st.sidebar.button("Retry Google Sheets connection"):
     try:
-        online2, members2, settings2, schedule2 = try_load_all()
+        online2, members2, settings2, schedule2, status2 = try_load_all()
         st.session_state.online = online2
         st.session_state.members_df = members2
         st.session_state.settings_df = settings2
         st.session_state.schedule_df = schedule2
+        st.session_state.game_count_df = status2
         st.experimental_rerun()
     except Exception as e:
         st.sidebar.error(f"Retry failed: {e}")
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["Schedule", "Members", "Settings"])
+#tab1, tab2, tab3 = st.tabs(["Schedule", "Members", "Settings"])
+
+schedule_tab, members_tab, settings_tab, status_tab = st.tabs([
+    "📅 Schedule", "🧑 Members", "⚙️ Settings", "ℹ️ Status"  
+])
 
 # ---------------------- Settings Tab ----------------------
-with tab3:
+with settings_tab:
     st.header("App Settings")
     # default settings
     default = {
@@ -391,7 +507,7 @@ with tab3:
             st.success("Settings saved locally")
 
 # ---------------------- Members Tab ----------------------
-with tab2:
+with members_tab:
     st.header("Members")
     # Ensure members_df has expected columns
     if st.session_state.members_df is None or st.session_state.members_df.empty:
@@ -430,7 +546,7 @@ with tab2:
             st.success("Members saved locally")
 
 # ---------------------- Schedule Tab ----------------------
-with tab1:
+with schedule_tab:
     st.header("Schedule Generator")
     # Filters
     members_for_filters = st.session_state.members_df if st.session_state.members_df is not None else pd.DataFrame()
@@ -481,12 +597,13 @@ with tab1:
         # sanitize names
         for p in player_dicts:
             p['name'] = str(p.get('name','')).strip()
-        rounds = generate_schedule(player_dicts, int(num_courts), int(num_rounds), tries=400)
+        rounds, game_count_df = generate_schedule(player_dicts, int(num_courts), int(num_rounds), tries=400)
         if not rounds:
             st.warning("Unable to generate schedule. Not enough players? Try reducing courts or rounds.")
         else:
             sched_df = schedule_to_dataframe(rounds, int(num_courts))
             st.session_state.schedule_df = sched_df.reset_index()
+            st.session_state.game_count_df = game_count_df
             # Display nicely
             st.subheader("Generated Schedule")
             st.dataframe(sched_df)
@@ -525,9 +642,38 @@ with tab1:
         except Exception:
             st.dataframe(st.session_state.schedule_df)
 
+with status_tab:
+    st.header("Status")
+    if st.session_state.game_count_df is not None and not (st.session_state.game_count_df.empty):
+        try:
+            # If stored as reset_index earlier, try to convert back to multiindex view for display
+            df_display = st.session_state.game_count_df.copy()
+            if 'index' in df_display.columns:
+                df_display = df_display.set_index('index')
+            # attempt to convert flat to MultiIndex if possible
+            # display
+            st.subheader("Number of game assigned for players")
+            st.dataframe(df_display)
+        except Exception:
+            st.dataframe(st.session_state.game_count_df)
+
+    if st.session_state.online:
+        try:
+            # schedule sheet: save flattened df
+            flat = st.session_state.game_count_df.copy()
+            save_google_sheet(st.secrets["google_sheets"].get("status_sheet", "status"), flat)
+            st.success("Status saved to Google Sheet")
+        except Exception as e:
+            st.error(f"Failed to save status to Google Sheet: {e}")
+        else:
+            save_local_cache_sheetname(st.session_state.game_count_df, "status")
+            st.success("Status saved to local cache")
+    
+
 # ---------------------- Footer / Tips ----------------------
 st.sidebar.markdown("---")
 st.sidebar.write("Notes:")
 st.sidebar.write("• The scheduler uses a heuristic that tries to minimize repeated partners/opponents and balance games played.")
 st.sidebar.write("• For perfect fairness across many players and rounds, consider an optimization solver (slower).")
+st.sidebar.write("• Web application is designed for private pickable group, contact tungocnguyen@gmail.com.")
 
