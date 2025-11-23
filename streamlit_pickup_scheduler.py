@@ -1,14 +1,14 @@
 """
 Streamlit Pickleball Scheduler (full)
 Features:
-- Load members/settings/schedule from a single Google Spreadsheet (sheet IDs in .streamlit/secrets.toml)
+- Load members/settings/schedule from a single Google Spreadsheet
 - Auto-attempt Google Sheets load at startup; if it fails, fall back to a local cache file local_cache.json
 - Show actual mode (online/offline) via the "Use Google Sheet" checkbox and status in the sidebar
 - Member management with editable table using st.data_editor
 - Settings tab to save last-used settings into the settings sheet/local cache
 - Schedule generator with fairness heuristics (minimize partner/opponent repeats, balance game counts)
 - Schedule display: rows = rounds, columns = courts with subcolumns Team 1 / Team 2 (e.g. "Alice / Cathy")
-- Filters (level, gender, active)
+- Filters (level, gender, active, mixing, repeat partner)
 - Export generated schedule to Excel
 
 Secrets expectations (.streamlit/secrets.toml):
@@ -20,8 +20,14 @@ spreadsheet_id = "YOUR_SPREADSHEET_ID"
 members_sheet = "members"
 schedule_sheet = "schedule"
 settings_sheet = "settings"
+status_sheet = "status"
 
 Run: streamlit run this_script.py
+Author: Tu Nguyen
+Date: November 23, 2025
+Version: 0.5
+pip install streamlit gspread google-auth openpyxl reportlab google-api-python-client google-auth-oauthlib google-auth-httplib2
+run local streamlit run this_script_filename
 """
 
 import streamlit as st
@@ -39,6 +45,10 @@ import random
 # Google API imports
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+mixing_options = ["Random", "Level-based", "Minimize repeats"]
+repeat_options = ["Avoid repeats", "Minimize", "No rule"]
+
 
 # ---------------------- Google Sheets helpers ----------------------
 
@@ -170,24 +180,28 @@ def save_local_cache_sheetname(df, sheet_name, path="local_cache.xlsx"):
 
 def save_local_cache(members, settings, schedule, path="local_cache.xlsx"):
     """Save all tables as an Excel workbook (no JSON)."""
+
+    save_local_cache_sheetname(members, "members", path)
+    save_local_cache_sheetname(settings, "settings", path)
+    save_local_cache_sheetname(schedule, "schedule", path)
 # Ensure clean DataFrames
-    if not isinstance(members, pd.DataFrame):
-        members = pd.DataFrame()
-    if not isinstance(settings, pd.DataFrame):
-        settings = pd.DataFrame()
-    if not isinstance(schedule, pd.DataFrame):
-        schedule = pd.DataFrame()
-    if not isinstance(status, pd.DataFrame):
-        status = pd.DataFrame()
+    # if not isinstance(members, pd.DataFrame):
+    #     members = pd.DataFrame()
+    # if not isinstance(settings, pd.DataFrame):
+    #     settings = pd.DataFrame()
+    # if not isinstance(schedule, pd.DataFrame):
+    #     schedule = pd.DataFrame()
+    # if not isinstance(status, pd.DataFrame):
+    #     status = pd.DataFrame()
     
-    with pd.ExcelWriter(path, engine="openpyxl") as writer: 
-        members.to_excel(writer, sheet_name="members", index=False)
-        settings.to_excel(writer, sheet_name="settings", index=False)
-        #schedule.to_excel(writer, sheet_name="schedule", index=False)
-        # Flatten MultiIndex columns if present
-        if isinstance(schedule.columns, pd.MultiIndex):
-            schedule.columns = ["_".join([str(c) for c in col]).strip() for col in schedule.columns]
-        schedule.to_excel(writer, sheet_name="schedule", index=False)
+    # with pd.ExcelWriter(path, engine="openpyxl") as writer: 
+    #     members.to_excel(writer, sheet_name="members", index=False)
+    #     settings.to_excel(writer, sheet_name="settings", index=False)
+    #     #schedule.to_excel(writer, sheet_name="schedule", index=False)
+    #     # Flatten MultiIndex columns if present
+    #     if isinstance(schedule.columns, pd.MultiIndex):
+    #         schedule.columns = ["_".join([str(c) for c in col]).strip() for col in schedule.columns]
+    #     schedule.to_excel(writer, sheet_name="schedule", index=False)
 
 
 # ---------------------- App load logic ----------------------
@@ -291,6 +305,199 @@ def try_load_all():
 #         rounds.append(best)
 #     return rounds
 
+
+
+
+def generate_schedule_mixing_rule(players, num_courts, num_rounds,
+                                  mixing="Random",
+                                  repeat_rule="Minimize",
+                                  tries=300):
+    """
+    players: list of dicts, with keys:
+        - name
+        - level (1–10)
+        - gender ("M" / "F")
+        - active ("Y" / "N")
+
+    mixing: one of ["Random", "Level-based", "Minimize repeats"]
+    repeat_rule: ["Avoid repeats","Minimize","No rule"]
+
+    Returns:
+        rounds: list of rounds (each round = list of groups of 4 names)
+        games_df: pandas DataFrame columns ["name","number_of_game"]
+    """
+
+    # Filter only active players
+    active_players = [p for p in players if p["active"].upper() == "Y"]
+
+    player_names = [p["name"] for p in active_players]
+    if len(player_names) < 4:
+        return [], pd.DataFrame(columns=["name", "number_of_game"])
+
+    # Quick maps for attributes
+    level_map  = {p["name"]: p["level"] for p in active_players}
+    gender_map = {p["name"]: p["gender"] for p in active_players}
+
+    n = len(player_names)
+    per_round = num_courts * 4
+
+    # Tracking
+    games_count = Counter({name: 0 for name in player_names})
+    partner_count = defaultdict(Counter)
+    opponent_count = defaultdict(Counter)
+
+    rounds = []
+
+    # Weight rules
+    REPEAT_WEIGHTS = {
+        "Avoid repeats": 12,
+        "Minimize": 6,
+        "No rule": 0
+    }
+    print(type(repeat_rule))
+    repeat_weight = REPEAT_WEIGHTS.get(repeat_rule, 6)
+
+    def score(groups):
+        """
+        Higher score = better schedule.
+        """
+        s = 0
+
+        # Fair play count (players with fewer games get boosted)
+        for g in groups:
+            for p in g:
+                s -= games_count[p] * 2.0
+
+        # Partner and opponent repeat penalties
+        for g in groups:
+            a, b, c, d = g
+
+            # partner repeats
+            s -= partner_count[a][b] * repeat_weight
+            s -= partner_count[c][d] * repeat_weight
+
+            # opponent repeats
+            for x in (a, b):
+                for y in (c, d):
+                    s -= opponent_count[x][y] * (repeat_weight / 2)
+
+            # Level-based mixing bonus (if enabled)
+            if mixing == "Level-based":
+                levels = [level_map[p] for p in g]
+                level_std = pd.Series(levels).std()
+                s += (10 - level_std)  # smaller spread => more balanced
+
+            # Minimize repeats mixing rule
+            if mixing == "Minimize repeats":
+                # Strongly reward groups with fewer historical pairings
+                pair_penalty = (
+                    partner_count[a][b] +
+                    partner_count[c][d] +
+                    opponent_count[a][c] + opponent_count[a][d] +
+                    opponent_count[b][c] + opponent_count[b][d]
+                )
+                s -= pair_penalty * 4
+
+        return s
+
+    # ======================
+    # Round generation loop
+    # ======================
+    for r in range(num_rounds):
+
+        best = None
+        best_score = -1e18
+
+        for _ in range(tries):
+
+            # Start fresh
+            pool = player_names.copy()
+
+            # Bias toward players with fewer games
+            pool.sort(key=lambda x: games_count[x])
+            random.shuffle(pool)
+
+            # If level-based sorting enabled
+            if mixing == "Level-based":
+                pool.sort(key=lambda x: level_map[x])
+
+            selected = pool[:min(per_round, len(pool))]
+            random.shuffle(selected)
+
+            groups = []
+
+            while len(selected) >= 4 and len(groups) < num_courts:
+                if mixing == "Random":
+                    g = [selected.pop(), selected.pop(), selected.pop(), selected.pop()]
+
+                elif mixing == "Level-based":
+                    # pick low/mid/high to blend skill levels
+                    selected.sort(key=lambda x: level_map[x])
+                    g = [
+                        selected.pop(0),   # lowest
+                        selected.pop(-1),  # highest
+                        selected.pop(len(selected)//2),  # mid
+                        selected.pop(0 if len(selected)>0 else -1)
+                    ]
+
+                elif mixing == "Minimize repeats":
+                    # Pick player with lowest games → pair with partners with least repeats
+                    p1 = selected.pop(0)
+                    partner_candidates = sorted(
+                        selected,
+                        key=lambda x: partner_count[p1][x] + opponent_count[p1][x]
+                    )
+                    p2 = partner_candidates[0]
+                    selected.remove(p2)
+
+                    # Opponents: least repeats with p1 & p2
+                    opponent_candidates = sorted(
+                        selected,
+                        key=lambda x: opponent_count[p1][x] + opponent_count[p2][x]
+                    )
+                    p3 = opponent_candidates[0]
+                    selected.remove(p3)
+                    p4 = selected.pop(0)
+
+                    g = [p1, p2, p3, p4]
+
+                groups.append(g)
+
+            if len(groups) < num_courts:
+                continue
+
+            sc = score(groups)
+
+            if sc > best_score:
+                best_score = sc
+                best = groups
+
+        if best is None:
+            break
+
+        # Commit results
+        for g in best:
+            a, b, c, d = g
+            for p in g:
+                games_count[p] += 1
+            partner_count[a][b] += 1
+            partner_count[b][a] += 1
+            partner_count[c][d] += 1
+            partner_count[d][c] += 1
+            for x in (a, b):
+                for y in (c, d):
+                    opponent_count[x][y] += 1
+                    opponent_count[y][x] += 1
+
+        rounds.append(best)
+
+    # Convert to DataFrame
+    games_df = pd.DataFrame([
+        {"name": name, "number_of_game": games_count[name]}
+        for name in player_names
+    ])
+
+    return rounds, games_df
 
 
 def generate_schedule(players, num_courts, num_rounds, tries=300):
@@ -485,13 +692,19 @@ with settings_tab:
     nc = st.number_input("Number of Courts", min_value=1, max_value=20, value=int(settings.get("number_of_courts", 2)))
     gd = st.number_input("Game Duration (min)", min_value=5, max_value=60, value=int(settings.get("game_duration", 12)))
     ts = st.number_input("Total Session Time (min)", min_value=20, max_value=600, value=int(settings.get("total_session", 132)))
-    mixing = st.selectbox("Mixing Rule", options=["Random","Level-based","Minimize repeats"], index=["Random","Level-based","Minimize repeats"].index(settings.get("mixing_rule", "Minimize repeats")))
-    repeat_rule = st.selectbox("Repeat Partner Rule", options=["Avoid repeats","Minimize","No rule"], index=["Avoid repeats","Minimize","No rule"].index(settings.get("repeat_partner_rule", "Minimize")))
-
+    
+    mixing = st.selectbox("Mixing Rule", options=mixing_options, index=mixing_options.index(settings.get("mixing_rule", "Minimize repeats")))
+    repeat_rule = st.selectbox("Repeat Partner Rule", options=repeat_options, index=repeat_options .index(settings.get("repeat_partner_rule", "Minimize")))
+    #print(f"From the setting tab mixing: {mixing}, repeate rule: {repeat_rule}")
+    s_df = pd.DataFrame([{"number_of_courts": nc, "game_duration": gd, "total_session": ts, "mixing_rule": mixing, "repeat_partner_rule": repeat_rule}])
+   
+    st.session_state.settings_df = s_df
+    #mixing2 = st.session_state.settings_df["mixing_rule"].iloc[0]
+    #repeat_rule2 = st.session_state.settings_df["repeat_partner_rule"].iloc[0]
+    #print(f"From the schedule tab mixing: {mixing2}, repeate rule: {repeat_rule2}")
+    
     if st.button("Save Settings"):
-        # store settings in settings_df (single-row)
-        s_df = pd.DataFrame([{"number_of_courts": nc, "game_duration": gd, "total_session": ts, "mixing_rule": mixing, "repeat_partner_rule": repeat_rule}])
-        st.session_state.settings_df = s_df
+        # store settings in settings_df (single-row)        
         #save_local_cache(st.session_state.members_df or pd.DataFrame(), s_df, st.session_state.schedule_df or pd.DataFrame())
         #save_local_cache(st.session_state.members_df, s_df, st.session_state.schedule_df)
         #save_local_cache(st.session_state.members_df if isinstance(st.session_state.members_df, pd.DataFrame) else pd.DataFrame(), s_df if isinstance(s_df, pd.DataFrame) else pd.DataFrame(), st.session_state.schedule_df if isinstance(st.session_state.schedule_df, pd.DataFrame) else pd.DataFrame())
@@ -559,19 +772,28 @@ with schedule_tab:
         mf = pd.DataFrame(columns=["name","level","gender","active"])
 
     # Default filters
-    level_min, level_max = st.slider("Level range", 1, 10, (1,10))
-    genders = st.multiselect("Gender", options=["F","M"], default=["F","M"])
-    active_only = st.checkbox("Active only", value=True)
+    #level_min, level_max = st.slider("Level range", 1, 10, (1,10))
+    #genders = st.multiselect("Gender", options=["F","M"], default=["F","M"])
+    #active_only = st.checkbox("Active only", value=True)
 
     # Settings quick inputs (read defaults from settings if available)
-    default_nc = int(st.session_state.settings_df.iloc[0].get("number_of_courts", 2)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 2
-    default_gd = int(st.session_state.settings_df.iloc[0].get("game_duration", 12)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 12
-    default_ts = int(st.session_state.settings_df.iloc[0].get("total_session", 132)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 132
+    #default_nc = int(st.session_state.settings_df.iloc[0].get("number_of_courts", 2)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 2
+    #default_gd = int(st.session_state.settings_df.iloc[0].get("game_duration", 12)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 12
+    #default_ts = int(st.session_state.settings_df.iloc[0].get("total_session", 132)) if (st.session_state.settings_df is not None and not st.session_state.settings_df.empty) else 132
 
-    num_courts = st.number_input("Number of courts", min_value=1, max_value=20, value=default_nc)
-    game_duration = st.number_input("Game duration (min)", min_value=5, max_value=60, value=default_gd)
-    total_session = st.number_input("Total session time (min)", min_value=20, max_value=600, value=default_ts)
-    num_rounds = st.number_input("Number of rounds", min_value=1, value=math.floor(total_session / game_duration))
+    # num_courts = st.number_input("Number of courts", min_value=1, max_value=20, value=default_nc)
+    # game_duration = st.number_input("Game duration (min)", min_value=5, max_value=60, value=default_gd)
+    # total_session = st.number_input("Total session time (min)", min_value=20, max_value=600, value=default_ts)
+    # num_rounds = st.number_input("Number of rounds", min_value=1, value=math.floor(total_session / game_duration))    
+
+    num_courts = st.session_state.settings_df["number_of_courts"].iloc[0]
+    game_duration = st.session_state.settings_df["game_duration"].iloc[0]
+    total_session = st.session_state.settings_df["total_session"].iloc[0]
+    mixing = st.session_state.settings_df["mixing_rule"].iloc[0]
+    repeat_rule = st.session_state.settings_df["repeat_partner_rule"].iloc[0]
+
+    #print(f"From the schedule tab mixing: {mixing}, repeate rule: {repeat_rule}")
+    num_rounds = math.floor(total_session / game_duration)
 
     # Build player list based on filters
     candidates = mf.copy()
@@ -580,10 +802,14 @@ with schedule_tab:
         candidates['level'] = candidates['level'].astype(int)
     except Exception:
         candidates['level'] = pd.to_numeric(candidates['level'], errors='coerce').fillna(0).astype(int)
-    if active_only:
-        candidates = candidates[candidates['active'].str.upper().isin(['Y','YES','TRUE'])]
+    
+    level_min = 1
+    level_max = 10
+    genders = ["F","M"]
+
+    candidates = candidates[candidates['active'].str.upper().isin(['Y','YES','TRUE'])]
     candidates = candidates[(candidates['level'] >= level_min) & (candidates['level'] <= level_max)]
-    candidates = candidates[candidates['gender'].isin(genders)]
+    candidates = candidates[candidates['gender'].isin(genders)]   
 
     st.write(f"Players considered: {len(candidates)}")
 
@@ -597,7 +823,8 @@ with schedule_tab:
         # sanitize names
         for p in player_dicts:
             p['name'] = str(p.get('name','')).strip()
-        rounds, game_count_df = generate_schedule(player_dicts, int(num_courts), int(num_rounds), tries=400)
+        #rounds, game_count_df = generate_schedule(player_dicts, int(num_courts), int(num_rounds), tries=400)
+        rounds, game_count_df = generate_schedule_mixing_rule(player_dicts, int(num_courts), int(num_rounds), mixing, repeat_rule, tries=400)
         if not rounds:
             st.warning("Unable to generate schedule. Not enough players? Try reducing courts or rounds.")
         else:
@@ -673,7 +900,7 @@ with status_tab:
 # ---------------------- Footer / Tips ----------------------
 st.sidebar.markdown("---")
 st.sidebar.write("Notes:")
-st.sidebar.write("• The scheduler uses a heuristic that tries to minimize repeated partners/opponents and balance games played.")
+st.sidebar.write("• The scheduler uses a heuristic that tries to minimize repeated partners/opponents and balance games played. (see the setting tab)")
 st.sidebar.write("• For perfect fairness across many players and rounds, consider an optimization solver (slower).")
-st.sidebar.write("• Web application is designed for private pickable group, contact tungocnguyen@gmail.com.")
+st.sidebar.write("• Web application is designed for private pickable group, contact to tungocnguyen@gmail.com for more information.")
 
