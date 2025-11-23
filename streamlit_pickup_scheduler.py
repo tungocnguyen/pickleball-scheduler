@@ -306,7 +306,7 @@ def to_excel_bytes(df):
 # ---------------------- Streamlit App ----------------------
 
 st.set_page_config(page_title="Pickleball Scheduler", layout="wide")
-st.title("Pickleball Scheduler")
+st.title("Elite Group Pickleball Scheduler")
 
 # Try to load data once at startup
 if "loaded_once" not in st.session_state:
